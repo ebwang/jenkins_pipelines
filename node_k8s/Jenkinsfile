@@ -1,0 +1,287 @@
+PROJECT_NAME = "nodeapp"
+LABEL = "js-${PROJECT_NAME}-${UUID.randomUUID().toString()}"
+NAMESPACES = [dev: "dev-nodeapp", qa: "qa-nodeapp", sandbox: "sandbox-nodeapp", prod: "nodeapp"]
+DEV_KUBE_CONFIG = [credentialsId: 'jenkins-dev', serverUrl: 'https://IP:PORT']
+QA_KUBE_CONFIG = [credentialsId: 'jenkins-qa', serverUrl: 'https://IP:PORT']
+SANDBOX_KUBE_CONFIG = [credentialsId: 'jenkins-sandbox', serverUrl: 'https://IP:PORT|']
+PROD_KUBE_CONFIG = [credentialsId: 'jenkins-prd', serverUrl: 'https://IP:PORT']
+
+node {
+  checkout scm
+  podTemplate(label: LABEL, inheritFrom: 'default', yaml: readFile('./infra/JenkinsContainers.yaml')){
+    node(LABEL) {
+      def REPOS = checkout scm
+      def TAG = sh(returnStdout: true, script: "grep -Eom 1  \'[[:digit:]]+\\.[[:digit:]]+\\.[[:digit:]]+\' CHANGELOG.md").trim()
+
+      if( REPOS.GIT_BRANCH != "master" && REPOS.GIT_BRANCH != "qa" ){
+        echo "Pipeline for pull requets branches"
+        setupStage()
+        testsStage()
+      }
+
+      if( REPOS.GIT_BRANCH == "dev" ){
+        echo "Pipeline for Dev branch"
+        setupStage()
+        testsStage()
+        buildImageStage("dev", true) // uses cache
+        deployWithArgo("dev", DEV_KUBE_CONFIG)
+      }
+
+      if( REPOS.GIT_BRANCH == "qa" ){
+        echo "Pipeline for QA branch"
+        setupStage()
+        testsStage()
+        buildImageStage("qa", true) // uses cache
+        deployWithArgo("qa", QA_KUBE_CONFIG)
+      }
+
+
+      // if is not branch master and it's a Pull Request
+      if( REPOS.GIT_BRANCH != "master" && env.CHANGE_ID ) {
+        sandboxAprove()
+        if( ENV_PROMOTE_OPTION == "SIM" ) {
+          buildImageStage("sandbox", true) // uses cache
+          deployWithArgo("sandbox", "sandbox", SANDBOX_KUBE_CONFIG)
+          currentBuild.displayName += "  - Deploy"
+        }
+        if( ENV_PROMOTE_OPTION == "NAO" ) {
+          echo "Não será realizado Deploy em Sandbox."
+          currentBuild.displayName += "  - Only Tests"
+        }
+      }
+
+      if( REPOS.GIT_BRANCH == "master" ){
+        echo "Pipeline for feature/better-pipeline branch"
+        getPipelineType()
+
+        if( PIPELINE_TYPE == "ONLY TESTS" ) {
+          setupStage()
+          testsStage()
+        }
+
+        if( PIPELINE_TYPE == "DEPLOY LATEST" ) {
+          setupStage()
+          testsStage()
+          releaseTagStage(TAG)
+          buildImageStage(TAG, false)
+          selectAndDeployToEnvironment(TAG)
+        }
+
+        if( PIPELINE_TYPE == "DEPLOY VERSION" ) {
+          stage('Type the tag to be deployed') {
+            def RELEASE_TAG = input message: 'Digite o nome da tag: ', ok: 'confirma',
+                          parameters: [string(defaultValue: '', description: 'Define a tag da image.', name: 'IMG_TAG')]
+            selectAndDeployToEnvironment(RELEASE_TAG)
+          }
+        }
+
+        if( PIPELINE_TYPE == "NONE" ) {
+          echo "Não será realizado Deploy."
+        }
+      }
+
+      logsStage()
+    }
+  }
+}
+
+def getPipelineType() {
+  stage('Pipeline Type'){
+    script{
+      try {
+        timeout(time: 2, unit:'MINUTES') {
+          PIPELINE_TYPE = input message: 'Qual o processo deseja fazer?', ok: 'ok', parameters: [choice(name: 'PIPELINE_TYPE',
+                          choices: ["ONLY TESTS","DEPLOY LATEST","DEPLOY VERSION", "NONE"], description: 'Selecione o pipeline.')]
+        }
+      } catch(err) { // timeout reached or input Aborted
+        def user = err.getCauses()[0].getUser()
+        if('SYSTEM' == user.toString()) { // SYSTEM means timeout
+          echo ("Input timeout expired, default pipeline will be used: ONLY TESTS")
+          PIPELINE_TYPE = "ONLY TESTS"
+        } else {
+          echo "Input aborted by: [${user}]"
+          error("Pipeline aborted by: [${user}]")
+        }
+      }
+    }
+  }
+}
+
+def selectAndDeployToEnvironment(TAG) {
+  stage('Em qual ambiente deverá ser realizado o Deploy?'){
+    script{
+      try {
+        timeout(time: 2, unit:'MINUTES') {
+          ENV_DEPLOY_OPTION = input message: 'Em qual ambiente será realizado o deploy ?', ok: 'ok',
+                          parameters: [choice(name: 'ENV_DEPLOY_OPTION', choices: ["PROD e SANDBOX","PROD","SANDBOX", "NENHUM"],
+                          defaultValue: 'default', description: 'Selecione em qual ambiente será realizado o deploy.')]
+        }
+      } catch(err) { // timeout reached or input Aborted
+        def user = err.getCauses()[0].getUser()
+
+        if('SYSTEM' == user.toString()) { // SYSTEM means timeout
+          echo ("Input timeout expired, default pipeline will be used: NENHUM")
+          ENV_DEPLOY_OPTION = "NENHUM"
+        } else {
+          echo "Input aborted by: [${user}]"
+          error("Pipeline aborted by: [${user}]")
+        }
+      }
+    }
+  }
+
+  if ( ENV_DEPLOY_OPTION.contains("SANDBOX") ) {
+    deployStage("sandbox", TAG, SANDBOX_KUBE_CONFIG)
+  }
+
+  if ( ENV_DEPLOY_OPTION.contains("PROD") ) {
+    deployStage("prod", TAG, PROD_KUBE_CONFIG)
+  }
+
+  if ( ENV_DEPLOY_OPTION.contains("NENHUM") ) {
+    echo "There will be no deploy"
+  }
+}
+
+def setupStage() {
+  stage('Setup'){
+    container('test-container'){
+        sh "mkdir -p /app/"
+        sh "cp -r package.json .npmrc /app/"
+        sh "cd /app/ && npm install"
+        sh "cp -r . /app/"
+    }
+  }
+}
+
+def testsStage() {
+  stage('Tests'){
+    parallel(
+      integration:{
+        container('test-container'){
+          sh 'echo "integration"'
+        }
+      },
+      acceptance:{
+        container('test-container'){
+          sh 'echo "acceptance"'
+        }
+      },
+      security:{
+        container('test-container'){
+          sh 'echo "teste"'
+        }
+      },
+      static_analisys:{
+        container('test-container'){
+          sh 'echo "Teste"'
+        }
+      },
+      unit_tests:{
+        container('test-container'){
+          sh """
+            export NODE_ENV=test
+            cd /app/
+            npm install && npm test
+          """
+        }
+      }
+    )
+  }
+}
+
+def releaseTagStage(TAG) {
+  stage("Push tag to git: ${TAG}") {
+    try {
+      sh """ echo ! git rev-parse -q --verify refs/tags/${TAG} | bash """
+    } catch (error) {
+      currentBuild.result = 'ABORTED'
+      error("Tag ${TAG} already exists! Aborting the build step.")
+    }
+    sshagent (credentials: ['automation']) {
+      sh 'git config --global user.email "jenkins@company.com"'
+      sh "git tag -m ':bookmark: tag version ${TAG}' -a ${TAG}"
+      sh "git push origin ${TAG}"
+    }
+  }
+}
+
+def buildImageStage(TAG, USE_CACHE) {
+  stage("Build image repo/${PROJECT_NAME}:${TAG}"){
+    container('docker-container'){
+      withCredentials([usernamePassword(credentialsId: 'DockerCredentials', passwordVariable: 'DOCKER_HUB_PASSWORD', usernameVariable: 'DOCKER_HUB_USER')]) {
+        sh "docker login -u ${DOCKER_HUB_USER} -p ${DOCKER_HUB_PASSWORD}"
+
+        if(USE_CACHE) {
+          sh "docker pull XXX/${PROJECT_NAME} || true"
+          sh "docker build --network=host --cache-from=XXX/${PROJECT_NAME}:${TAG} -t XXX/${PROJECT_NAME}:${TAG} ."
+        } else {
+          sh "docker build --network=host -t XXX/${PROJECT_NAME}:${TAG} ."
+        }
+
+        sh "docker push XXX/${PROJECT_NAME}:${TAG}"
+      }
+    }
+  }
+}
+
+def deployStage(ENV_DEPLOY, TAG, KUBE_CONFIG) {
+  stage("Deploy in ${ENV_DEPLOY.toUpperCase()}"){
+    container('kubectl-container'){
+      withKubeConfig(KUBE_CONFIG){
+        sh """
+          kubectl -n ${NAMESPACES[ENV_DEPLOY]} replace -f ./infra/${ENV_DEPLOY}/k8s/${PROJECT_NAME}-secrets.yaml
+
+          sed s%IMAGETAG%${TAG}% ./infra/${ENV_DEPLOY}/k8s/${PROJECT_NAME}-deploy.yaml | kubectl -n ${NAMESPACES[ENV_DEPLOY]} apply -f -
+          kubectl -n ${NAMESPACES[ENV_DEPLOY]} patch deployment/${PROJECT_NAME} -p "{\\"spec\\":{\\"template\\":{\\"metadata\\":{\\"labels\\":{\\"date\\":\\"`date +'%s'`\\"}}}}}"
+          kubectl -n ${NAMESPACES[ENV_DEPLOY]} rollout status deployment/${PROJECT_NAME}
+        """
+      }
+    }
+  }
+}
+
+def deployWithArgo(ENV_DEPLOY, KUBE_CONFIG) {
+  stage("Deploy in ${ENV_DEPLOY.toUpperCase()}"){
+    container('kubectl-container'){
+      withKubeConfig(KUBE_CONFIG){
+        sh """
+          kubectl -n ${NAMESPACES[ENV_DEPLOY]} rollout restart deployment/${PROJECT_NAME}
+          kubectl -n ${NAMESPACES[ENV_DEPLOY]} rollout status deployment/${PROJECT_NAME}
+        """
+      }
+    }
+  }
+}
+
+def logsStage() {
+  stage('Logs'){
+    containerLog('docker-container')
+    containerLog('kubectl-container')
+    containerLog('test-container')
+  }
+}
+
+def sandboxAprove() {
+  stage('Deploy in Sandbox?'){
+    script{
+      try {
+        timeout(time: 5, unit:'MINUTES') {
+          ENV_PROMOTE_OPTION = input message: 'Aprova deploy em Sandbox?', ok: 'ok',
+                          parameters: [choice(name: 'ENV_PROMOTE_OPTION', choices: ["SIM","NAO"],
+                          defaultValue: 'NAO', description: 'Realizar o deploy da mesma imagem já validada em QA no ambiente de Sandbox.')]
+        }
+      } catch(err) { // timeout reached or input Aborted
+        def user = err.getCauses()[0].getUser()
+
+        if('SYSTEM' == user.toString()) { // SYSTEM means timeout
+          echo ("Input timout atingido.")
+          ENV_PROMOTE_OPTION = "NAO"
+        } else {
+          echo "Input aborted by: [${user}]"
+          error("Pipeline aborted by: [${user}]")
+        }
+      }
+    }
+  }
+}
